@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	version = "1.1.0"
+	version = "1.1.1"
 	author  = "Just Glitch <https://github.com/Just69Glitch>"
 )
 
@@ -54,13 +54,18 @@ const (
 )
 
 type Config struct {
-	Port    string `json:"port"`
-	IconDir string `json:"iconDir"`
+	Port      string `json:"port"`
+	IconDir   string `json:"iconDir"`
+	DebugMode bool   `json:"debugMode"`
 }
 
 // RequestLogger is a middleware that logs all HTTP requests with colors
-func RequestLogger(next http.Handler) http.Handler {
+func RequestLogger(cfg *Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !cfg.DebugMode {
+			next.ServeHTTP(w, r)
+			return
+		}
 		start := time.Now()
 		ip := r.RemoteAddr
 		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
@@ -222,43 +227,82 @@ func selectValidIconDir() (string, error) {
 	}
 }
 
+func promptDebugMode() (bool, error) {
+	err := zenity.Question(
+		"Enable debug mode? This will log every request.",
+		zenity.Title("Debug Mode"),
+	)
+	if err == zenity.ErrCanceled {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func loadOrCreateConfig() (*Config, error) {
+	log.Printf("%sChecking config file: %s%s", colorGray, configFile, colorReset)
+
+	// Check if config file exists
 	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		cfg := &Config{
-			IconDir: "nil",
-			Port:    "nil",
+		log.Printf("%sNo config found. Creating new one.%s", colorYellow, colorReset)
+		debugModeEnabled, err := promptDebugMode()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get debug mode preference: %v", err)
 		}
-		log.Printf("%sCreating default config: %s%s", colorYellow, configFile, colorReset)
-		return cfg, saveConfig(cfg)
+
+		cfg := &Config{
+			IconDir:   "nil",
+			Port:      "nil",
+			DebugMode: debugModeEnabled,
+		}
+		log.Printf("%sCreating default config with DebugMode=%v%s", colorYellow, cfg.DebugMode, colorReset)
+		if err := saveConfig(cfg); err != nil {
+			return nil, fmt.Errorf("failed to save new config: %v", err)
+		}
+		return cfg, nil
 	}
 
+	// Load existing config
 	data, err := os.ReadFile(configFile)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
+	log.Printf("%sFound config content%s", colorGray, colorReset)
 
 	var cfg Config
-	err = json.Unmarshal(data, &cfg)
-	if err != nil {
-		return nil, err
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config JSON: %v", err)
 	}
 
-	if !isValidPort(cfg.Port) {
-		newPort, err := promptForValidPort()
-		if err != nil {
-			return nil, err
+	// Validate the DebugMode field
+	var tempMap map[string]interface{}
+	if err := json.Unmarshal(data, &tempMap); err == nil {
+		debugValue, exists := tempMap["debugMode"]
+		if !exists || (debugValue != true && debugValue != false) {
+			log.Printf("%sDebugMode is missing or invalid in config. Prompting user...%s", colorYellow, colorReset)
+			debugModeEnabled, err := promptDebugMode()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get debug mode preference: %v", err)
+			}
+			cfg.DebugMode = debugModeEnabled
+			log.Printf("%sSetting DebugMode to %v in config%s", colorGreen, cfg.DebugMode, colorReset)
+			if err := saveConfig(&cfg); err != nil {
+				return nil, fmt.Errorf("failed to update config with DebugMode: %v", err)
+			}
 		}
-		cfg.Port = newPort
-		if err := saveConfig(&cfg); err != nil {
-			return nil, err
-		}
+	} else {
+		log.Printf("%sFailed to unmarshal config into map for DebugMode validation%s", colorRed, colorReset)
 	}
 
+	log.Printf("%sLoaded config successfully. DebugMode=%v%s", colorGreen, cfg.DebugMode, colorReset)
 	return &cfg, nil
 }
 
 func saveConfig(cfg *Config) error {
 	data, _ := json.MarshalIndent(cfg, "", "  ")
+	log.Printf("%sSaving config to disk%s", colorGray, colorReset)
 	return os.WriteFile(configFile, data, 0644)
 }
 
@@ -414,10 +458,10 @@ func main() {
 	log.Printf("%sServing icons from: %s%s", colorGreen, cfg.IconDir, colorReset)
 	log.Printf("%sUsing port: %s%s", colorGreen, cfg.Port, colorReset)
 
-	iconHandler := RequestLogger(CORSMiddleware(http.StripPrefix("/Icons", http.FileServer(http.Dir(cfg.IconDir)))))
+	iconHandler := RequestLogger(cfg, CORSMiddleware(http.StripPrefix("/Icons", http.FileServer(http.Dir(cfg.IconDir)))))
 	http.Handle("/Icons/", iconHandler)
 
-	listHandler := RequestLogger(CORSMiddleware(http.HandlerFunc(listIcons(cfg.IconDir))))
+	listHandler := RequestLogger(cfg, CORSMiddleware(http.HandlerFunc(listIcons(cfg.IconDir))))
 	http.Handle("/Icons/list", listHandler)
 
 	fmt.Printf("%sServing icons on http://localhost:%s/Icons/%s\n", colorCyan, cfg.Port, colorReset)
