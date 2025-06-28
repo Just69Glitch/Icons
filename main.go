@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	version = "1.0.0"
+	version = "1.1.0"
 	author  = "Just Glitch <https://github.com/Just69Glitch>"
 )
 
