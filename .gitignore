@@ -1,4 +1,6 @@
 /assets
 /build
 *.exe
+/tmp
+/.vscode
 *.json
