@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -42,13 +43,19 @@ type loggingResponseWriter struct {
 	statusCode int
 }
 
+type ansiStripper struct {
+	w io.Writer
+}
+
 var (
-	version = "1.2.0"
+	version = "1.2.1"
 	author  = "Just Glitch <https://github.com/Just69Glitch>"
 )
 
 const (
 	configFile = "config.json"
+	logsDir    = "logs"
+	timeFormat = "2006-01-02_15-04-05.000"
 )
 
 // ANSI color codes
@@ -78,6 +85,65 @@ func CORSMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func stripANSI(input []byte) []byte {
+	var buf bytes.Buffer
+	inEscape := false
+
+	for _, b := range input {
+		if inEscape {
+			if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') {
+				inEscape = false
+			}
+			continue
+		}
+
+		if b == '\x1b' { // ANSI escape character
+			inEscape = true
+			continue
+		}
+
+		buf.WriteByte(b)
+	}
+
+	return buf.Bytes()
+}
+
+func setupSessionLogging() (*os.File, error) {
+	// Create logs directory if it doesn't exist
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create logs directory: %v", err)
+	}
+
+	// Generate filename with current timestamp
+	logFileName := filepath.Join(logsDir, fmt.Sprintf("session_%s.log", time.Now().Format(timeFormat)))
+
+	// Create or open the log file
+	logFile, err := os.OpenFile(logFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create log file: %v", err)
+	}
+
+	// Write session header
+	fmt.Fprintf(logFile, "=== Icon Server Session Started at %s ===\n", time.Now().Format("2006-01-02 15:04:05.000 MST"))
+	fmt.Fprintf(logFile, "Version: %s\n", version)
+	fmt.Fprintf(logFile, "Author: %s\n\n", author)
+
+	// Configure logging to both file and console
+	log.SetOutput(io.MultiWriter(
+		os.Stdout,                 // Keep colors for console
+		&ansiStripper{w: logFile}, // Strip colors for file
+	))
+
+	// Add timestamp to each log entry
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	return logFile, nil
+}
+
+func (w *ansiStripper) Write(p []byte) (n int, err error) {
+	return w.w.Write(stripANSI(p))
 }
 
 // RequestLogger is a middleware that logs all HTTP requests with colors
@@ -127,10 +193,7 @@ func RequestLogger(cfg *Config, next http.Handler) http.Handler {
 			methodColor = colorRed
 		}
 
-		log.Printf("%s[%s]%s %s%s%s %s%s%s %s%d%s %s%v%s - IP: %s%s%s, Icon: %s%s%s, User-Agent: %s%s%s",
-			colorGray,
-			start.Format("2006-01-02 15:04:05"),
-			colorReset,
+		log.Printf("%s%s%s %s%s%s %s%d%s %s%v%s - IP: %s%s%s, Icon: %s%s%s, User-Agent: %s%s%s",
 			methodColor,
 			r.Method,
 			colorReset,
@@ -376,7 +439,7 @@ func (c *IconCache) Rebuild(iconDir string) error {
 
 		// Build search index (filename without .svg)
 		name := strings.TrimSuffix(strings.ToLower(file), ".svg")
-		for _, term := range strings.Split(name, "-") {
+		for term := range strings.SplitSeq(name, "-") {
 			if len(term) >= 2 {
 				newSearchIndex[term] = append(newSearchIndex[term], i)
 			}
@@ -628,6 +691,18 @@ func watchDirectory(dir string, cache *IconCache) {
 }
 
 func main() {
+	logFile, err := setupSessionLogging()
+	if err != nil {
+		log.Fatalf("%sError setting up logging: %v%s", colorRed, err, colorReset)
+	}
+
+	defer func() {
+		// Write session end timestamp
+		fmt.Fprintf(logFile, "\n=== Session Ended at %s ===\n",
+			time.Now().Format("2006-01-02 15:04:05.000 MST"))
+		logFile.Close()
+	}()
+
 	log.Printf("%sStarting Icon Server v%s by %s%s", colorCyan, version, author, colorReset)
 	cfg, err := loadOrCreateConfig()
 	if err != nil {
@@ -689,7 +764,7 @@ func main() {
 	http.Handle("/Icons/", iconHandler(cfg, cache))
 	http.Handle("/Icons/list", listHandler(cfg, cache))
 
-	fmt.Printf("%sServing icons on http://localhost:%s/Icons/%s\n", colorCyan, cfg.Port, colorReset)
+	log.Printf("%sServing icons on http://localhost:%s/Icons/%s\n", colorCyan, cfg.Port, colorReset)
 	log.Printf("%sServer starting on port %s...%s", colorGreen, cfg.Port, colorReset)
 	if err := http.ListenAndServe(":"+cfg.Port, nil); err != nil {
 		log.Fatalf("%sServer failed to start: %v%s", colorRed, err, colorReset)
