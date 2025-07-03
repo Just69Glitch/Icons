@@ -1,27 +1,67 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/ncruces/zenity"
 )
 
+type Config struct {
+	Port      string `json:"port"`
+	IconDir   string `json:"iconDir"`
+	DebugMode bool   `json:"debugMode"`
+}
+
+type IconCache struct {
+	mu          sync.RWMutex
+	icons       map[string][]byte // filename -> content
+	names       []string          // sorted list of filenames
+	nameIndex   map[string]int    // filename -> index in names slice
+	searchIndex map[string][]int  // search term -> slice of indexes in names
+	htmlPage    []byte            // cached HTML page
+	gzippedPage []byte            // gzipped version of HTML page
+	lastUpdated time.Time
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
 var (
-	version = "1.1.1"
+	version = "1.2.0"
 	author  = "Just Glitch <https://github.com/Just69Glitch>"
 )
 
 const (
 	configFile = "config.json"
+)
+
+// ANSI color codes
+const (
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorBlue   = "\033[34m"
+	colorPurple = "\033[35m"
+	colorCyan   = "\033[36m"
+	colorWhite  = "\033[37m"
+	colorGray   = "\033[90m"
 )
 
 func CORSMiddleware(next http.Handler) http.Handler {
@@ -38,25 +78,6 @@ func CORSMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
-}
-
-// ANSI color codes
-const (
-	colorReset  = "\033[0m"
-	colorRed    = "\033[31m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorBlue   = "\033[34m"
-	colorPurple = "\033[35m"
-	colorCyan   = "\033[36m"
-	colorWhite  = "\033[37m"
-	colorGray   = "\033[90m"
-)
-
-type Config struct {
-	Port      string `json:"port"`
-	IconDir   string `json:"iconDir"`
-	DebugMode bool   `json:"debugMode"`
 }
 
 // RequestLogger is a middleware that logs all HTTP requests with colors
@@ -135,10 +156,26 @@ func RequestLogger(cfg *Config, next http.Handler) http.Handler {
 	})
 }
 
-// loggingResponseWriter wraps http.ResponseWriter to capture status code
-type loggingResponseWriter struct {
-	http.ResponseWriter
-	statusCode int
+func insertCommas(n int) string {
+	in := strconv.Itoa(n)
+	if len(in) <= 3 {
+		return in
+	}
+	var out strings.Builder
+	mod := len(in) % 3
+	if mod > 0 {
+		out.WriteString(in[:mod])
+		if len(in) > mod {
+			out.WriteByte(',')
+		}
+	}
+	for i := mod; i < len(in); i += 3 {
+		out.WriteString(in[i : i+3])
+		if i+3 < len(in) {
+			out.WriteByte(',')
+		}
+	}
+	return out.String()
 }
 
 func (lrw *loggingResponseWriter) WriteHeader(code int) {
@@ -306,6 +343,127 @@ func saveConfig(cfg *Config) error {
 	return os.WriteFile(configFile, data, 0644)
 }
 
+func NewIconCache(iconDir string) (*IconCache, error) {
+	cache := &IconCache{
+		icons:       make(map[string][]byte),
+		nameIndex:   make(map[string]int),
+		searchIndex: make(map[string][]int),
+	}
+	if err := cache.Rebuild(iconDir); err != nil {
+		return nil, err
+	}
+	return cache, nil
+}
+
+func (c *IconCache) Rebuild(iconDir string) error {
+	files, err := getSortedIconNames(iconDir)
+	if err != nil {
+		return err
+	}
+
+	newIcons := make(map[string][]byte)
+	newNameIndex := make(map[string]int)
+	newSearchIndex := make(map[string][]int)
+
+	for i, file := range files {
+		content, err := os.ReadFile(filepath.Join(iconDir, file))
+		if err != nil {
+			return err
+		}
+
+		newIcons[file] = content
+		newNameIndex[file] = i
+
+		// Build search index (filename without .svg)
+		name := strings.TrimSuffix(strings.ToLower(file), ".svg")
+		for _, term := range strings.Split(name, "-") {
+			if len(term) >= 2 {
+				newSearchIndex[term] = append(newSearchIndex[term], i)
+			}
+		}
+	}
+
+	// Build HTML page
+	var htmlBuilder strings.Builder
+	htmlBuilder.WriteString(`<!DOCTYPE html><html><head><title>Icon Server - All Icons</title><style>body { font-family: Arial, sans-serif; margin: 20px; }.icon-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 15px; }.icon-item { text-align: center; padding: 10px; border: 1px solid #eee; border-radius: 5px; }.icon-item:hover { background-color: #f5f5f5; }.icon-img { height: 50px; width: 50px; margin-bottom: 5px; }.icon-name { word-break: break-all; font-size: 12px; }</style></head><body><h1>Available Icons (Total: ` + insertCommas(len(files)) + `)</h1><div class="icon-grid">`)
+
+	for _, name := range files {
+		htmlBuilder.WriteString(`<div class="icon-item"><a href="/Icons/`)
+		htmlBuilder.WriteString(name)
+		htmlBuilder.WriteString(`"><div class="icon-name">`)
+		htmlBuilder.WriteString(name)
+		htmlBuilder.WriteString(`</div></a></div>`)
+	}
+
+	htmlBuilder.WriteString(`</div></body></html>`)
+
+	htmlPage := []byte(htmlBuilder.String())
+	var gzippedBuf bytes.Buffer
+	gz := gzip.NewWriter(&gzippedBuf)
+	if _, err := gz.Write(htmlPage); err != nil {
+		return err
+	}
+	if err := gz.Close(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.icons = newIcons
+	c.names = files
+	c.nameIndex = newNameIndex
+	c.searchIndex = newSearchIndex
+	c.htmlPage = htmlPage
+	c.gzippedPage = gzippedBuf.Bytes()
+	c.lastUpdated = time.Now()
+
+	return nil
+}
+
+func (c *IconCache) GetIcon(name string) ([]byte, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	content, exists := c.icons[name]
+	return content, exists
+}
+
+func (c *IconCache) Search(query string) []string {
+	query = strings.ToLower(query)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if len(query) < 2 {
+		return nil
+	}
+
+	var results []string
+	if indexes, exists := c.searchIndex[query]; exists {
+		for _, idx := range indexes {
+			results = append(results, c.names[idx])
+		}
+	} else {
+		// Fallback to full scan if not in index
+		for _, name := range c.names {
+			if strings.Contains(strings.ToLower(name), query) {
+				results = append(results, name)
+			}
+		}
+	}
+	return results
+}
+
+func (c *IconCache) GetHTML() []byte {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.htmlPage
+}
+
+func (c *IconCache) GetGzippedHTML() []byte {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.gzippedPage
+}
+
 func getSortedIconNames(iconDir string) ([]string, error) {
 	entries, err := fs.ReadDir(os.DirFS(iconDir), ".")
 	if err != nil {
@@ -337,14 +495,42 @@ func writeJSONResponse(w http.ResponseWriter, files []string, page, limit, total
 	fmt.Fprintf(w, `]}`)
 }
 
-func listIcons(iconDir string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func iconHandler(cfg *Config, cache *IconCache) http.Handler {
+	return RequestLogger(cfg, CORSMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Handle requests for the root path "/Icons/" or "/Icons"
+		if r.URL.Path == "/Icons/" || r.URL.Path == "/Icons" {
+			if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+				w.Header().Set("Content-Encoding", "gzip")
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Write(cache.GetGzippedHTML())
+			} else {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Write(cache.GetHTML())
+			}
+			return
+		}
+
+		// Handle requests for specific icons
+		iconName := strings.TrimPrefix(r.URL.Path, "/Icons/")
+		if content, exists := cache.GetIcon(iconName); exists {
+			w.Header().Set("Content-Type", "image/svg+xml")
+			w.Write(content)
+		} else {
+			http.NotFound(w, r)
+		}
+	})))
+}
+
+func listHandler(cfg *Config, cache *IconCache) http.Handler {
+	return RequestLogger(cfg, CORSMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
-		hasPage := query.Has("page")
-		hasLimit := query.Has("limit")
 		searchQuery := strings.TrimSpace(strings.ToLower(query.Get("search")))
+
+		// Get pagination parameters
 		page := 1
 		limit := 1000
+		hasPage := query.Has("page")
+		hasLimit := query.Has("limit")
 
 		if hasPage || hasLimit {
 			pageStr := query.Get("page")
@@ -360,27 +546,13 @@ func listIcons(iconDir string) http.HandlerFunc {
 			}
 		}
 
-		allFiles, err := getSortedIconNames(iconDir)
-		if err != nil {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
-
 		var files []string
-		if len(searchQuery) > 0 && len(searchQuery) < 2 {
-			files = []string{}
-		} else if len(searchQuery) >= 2 {
-			// If the search query is at least 2 characters, filter the files
-			for _, file := range allFiles {
-				// Remove .svg extension for comparison
-				fileName := strings.TrimSuffix(strings.ToLower(file), ".svg")
-				if strings.Contains(fileName, searchQuery) {
-					files = append(files, file)
-				}
-			}
+		if searchQuery != "" {
+			files = cache.Search(searchQuery)
 		} else {
-			// No search query, return all files
-			files = allFiles
+			cache.mu.RLock()
+			files = append([]string{}, cache.names...)
+			cache.mu.RUnlock()
 		}
 
 		total := len(files)
@@ -409,7 +581,50 @@ func listIcons(iconDir string) http.HandlerFunc {
 		}
 
 		writeJSONResponse(w, files[start:end], page, limit, total)
+	})))
+}
+
+func watchDirectory(dir string, cache *IconCache) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("%sFailed to create watcher: %v%s", colorRed, err, colorReset)
+		return
 	}
+	defer watcher.Close()
+
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+					if strings.HasSuffix(strings.ToLower(event.Name), ".svg") {
+						log.Printf("%sDetected change in icons, rebuilding cache...%s", colorYellow, colorReset)
+						time.Sleep(500 * time.Millisecond) // debounce
+						if err := cache.Rebuild(dir); err != nil {
+							log.Printf("%sError rebuilding cache: %v%s", colorRed, err, colorReset)
+						} else {
+							log.Printf("%sCache rebuilt successfully%s", colorGreen, colorReset)
+						}
+					}
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Printf("%sWatcher error: %v%s", colorRed, err, colorReset)
+			}
+		}
+	}()
+
+	if err := watcher.Add(dir); err != nil {
+		log.Printf("%sError watching directory: %v%s", colorRed, err, colorReset)
+		return
+	}
+	<-done
 }
 
 func main() {
@@ -458,11 +673,21 @@ func main() {
 	log.Printf("%sServing icons from: %s%s", colorGreen, cfg.IconDir, colorReset)
 	log.Printf("%sUsing port: %s%s", colorGreen, cfg.Port, colorReset)
 
-	iconHandler := RequestLogger(cfg, CORSMiddleware(http.StripPrefix("/Icons", http.FileServer(http.Dir(cfg.IconDir)))))
-	http.Handle("/Icons/", iconHandler)
+	log.Printf("%sLoading icons...%s", colorCyan, colorReset)
+	start := time.Now()
+	cache, err := NewIconCache(cfg.IconDir)
+	elapsed := time.Since(start)
+	if err != nil {
+		log.Fatalf("%sError initializing icon cache: %v%s", colorRed, err, colorReset)
+	}
+	formattedCount := insertCommas(len(cache.names))
+	log.Printf("%sLoaded: %s[%s]%s icons successfully%s in [%s%.2fs%s]", colorGreen, colorRed, formattedCount, colorGreen, colorReset, colorGray, elapsed.Seconds(), colorReset)
 
-	listHandler := RequestLogger(cfg, CORSMiddleware(http.HandlerFunc(listIcons(cfg.IconDir))))
-	http.Handle("/Icons/list", listHandler)
+	// Start filesystem watcher
+	go watchDirectory(cfg.IconDir, cache)
+
+	http.Handle("/Icons/", iconHandler(cfg, cache))
+	http.Handle("/Icons/list", listHandler(cfg, cache))
 
 	fmt.Printf("%sServing icons on http://localhost:%s/Icons/%s\n", colorCyan, cfg.Port, colorReset)
 	log.Printf("%sServer starting on port %s...%s", colorGreen, cfg.Port, colorReset)
